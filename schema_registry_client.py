@@ -1,56 +1,78 @@
 from confluent_kafka import schema_registry
+import argparse
 import json
 
-subject = 'dbserver1.inventory.customers-value'
-
-def create_client(url='http://localhost:8081'):
+def create_client(url):
     params = {'url': url}
     client = schema_registry.SchemaRegistryClient(params)
     return client
 
-def get_versions(client, subject='dbserver1.inventory.customers-value'):
-    return client.get_versions(subject)
+def get_schema_object(client, subject):
+    schema_id = client.get_latest_version(subject).schema_id
+    return client.get_schema(schema_id)
 
-def get_version(client, subject='dbserver1.inventory.customers-value', version=None):
-    if not version:
-        return client.get_latest_version(subject)
+def register_schema_from_json(client, schema_json, subject):
+    schema_str = json.dumps(schema_json)
+    schema_str = schema_str.replace(" ", "")
+    schema = schema_registry.Schema(schema_str, 'AVRO')
+    client.register_schema(subject, schema)
+
+def update_value(client, value_subject, analytics_subject):
+    # get latest value Schema object
+    value_schema = get_schema_object(client, value_subject)
+    # get latest analytics Schema object
+    analytics_schema = get_schema_object(client, analytics_subject)
+
+    # compare fields
+    value_schema_str = value_schema.schema_str
+    value_schema_json = json.loads(value_schema_str)
+    analytics_schema_str = analytics_schema.schema_str
+    analytics_schema_json = json.loads(analytics_schema_str)
+
+    # if fields are equal, no need to update. else update with analytics
+    if value_schema_json['fields'] == analytics_schema_json['fields']:
+        print("Schemas up to date")
+        return
+    # update value fields
+    value_schema_json['fields'] = analytics_schema_json['fields']
+
+    # create new value schema
+    register_schema_from_json(client, value_schema_json, value_subject)
+
+
+def add_analytics(client, value_subject, analytics_subject):
+    # get latest value Schema object
+    value_schema = get_schema_object(client, value_subject)
+    value_schema_str = value_schema.schema_str
+
+    # modify for analytics schema
+    schema_json = json.loads(value_schema_str)
+    schema_json['connect.name'] = schema_json['connect.name'].replace("Value", "Analytics")
+    
+    # create new analytics schema
+    register_schema_from_json(client, schema_json, analytics_subject)
+
+def run(target_subject, registry_url='http://localhost:8081'):
+    client = create_client(registry_url)
+    value_subject = f'{target_subject}-value'
+    analytics_subject = f'{target_subject}-analytics'
+    available_subjects = client.get_subjects()
+    if value_subject not in available_subjects:
+        print("Value subject missing... Check downstream...")
+        return
+    if analytics_subject in available_subjects:
+        update_value(client, value_subject, analytics_subject)
+        return
     else:
-        return client.get_version(subject, version)
+        add_analytics(client, value_subject, analytics_subject)
+        return
 
-def check_existence(client, subject, schema_content):
-    available_schemas = client.get_versions(subject)
-    latest_schema_id = 0
-    for version_id in available_schemas:
-        schema_id = client.get_version(subject, version_id).schema_id
-        schema = json.loads(client.get_schema(schema_id).schema_str)
-        if schema['fields'] == schema_content:
-            print("Current schema already registered")
-            return None
-        if schema['fields'] in schema_content:
-            # we collect latest schema that is a subset of schema_content
-            latest_schema_id = schema_id
-    return latest_schema_id
-
-
-def update_schema_registry(client, subject, schema_content):
-    # check if schema already exists
-    old_schema_id = check_existence(client, subject, schema_content)
-    if not old_schema_id:
-        return None
-    old_schema = client.get_schema(old_schema_id)
-    old_schema_str = old_schema.schema_str
-    new_schema_str = json.loads(old_schema_str)
-    # TO-DO:
-    # get updated column from new_schema_str
-
-    # Example:
-    new_schema_str['fields'].append({'name': 'phone', 'type': ['null', 'int'], 'default': None})
-    new_schema_str = json.dumps(new_schema_str)
-    new_schema_str = new_schema_str.replace(" ", "")
-    new_schema = schema_registry.Schema(new_schema_str, 'AVRO')
-
-    # test compataibility
-    client.test_compatibility('dbserver1.inventory.customers-value', new_schema)
-
-    #register schema
-    client.register_schema('dbserver1.inventory.customers-value', new_schema)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--registry_url", type=str)
+    parser.add_argument("--logical_name", type=str)
+    parser.add_argument("--database", type=str)
+    parser.add_argument("--table", type=str)
+    args = parser.parse_args()
+    target_subject= f'{args.logical_name}.{args.database}.{args.table}'
+    run(target_subject, args.registry_url)
